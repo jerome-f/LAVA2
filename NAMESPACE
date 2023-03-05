@@ -3,6 +3,7 @@
 export(meta.analyse.locus)
 export(process.eqtl.input)
 export(process.eqtl.locus)
+export(optimal_SVHT_coef)
 export(process.input)
 export(process.locus)
 export(process.locus_opt)
