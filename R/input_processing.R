@@ -34,6 +34,75 @@
 #' 
 #' @export
 
+optimal_SVHT_coef_sigma_unknown <- function(beta) {
+  coef.unknown <- optimal_SVHT_coef_sigma_known(beta)
+  MPmedian <- rep(0, length(beta))
+  for (i in 1:length(beta)) {
+    MPmedian[i] <- median_marcenko_pastur(beta[i])
+  }
+  omega <- coef.unknown / sqrt(MPmedian)
+  return(omega)
+}
+
+optimal_SVHT_coef_sigma_known <- function(beta) {
+  w <- (8 * beta) / (beta + 1 + sqrt(beta^2 + 14 * beta + 1))
+  lambda_star <- sqrt(2 * (beta + 1) + w)
+  return(lambda_star)
+}
+
+inc_mar_pas <- function(x0, beta, gamma) {
+  if (beta > 1) stop("Beta must be <= 1")
+  topSpec <- (1 + sqrt(beta))^2
+  botSpec <- (1 - sqrt(beta))^2
+  MarPas <- function(x) ifelse((topSpec - x) * (x - botSpec) > 0,
+                             sqrt((topSpec - x) * (x - botSpec)) /
+                               (beta * x) / (2 * pi), 0)
+  if (gamma != 0) {
+    fun <- function(x) (x^gamma * MarPas(x))
+  } else {
+    fun <- function(x) MarPas(x)
+  }
+  Int <- stats::integrate(fun, x0, topSpec)
+  return(Int$value)
+}
+
+median_marcenko_pastur <- function(beta) {
+  MarPas <- function(x) 1 - inc_mar_pas(x, beta, 0)
+  lobnd <- (1 - sqrt(beta))^2
+  hibnd <- (1 + sqrt(beta))^2
+  change <- 1
+  while (change & (hibnd - lobnd > .001)) {
+    change <- 0
+    x <- seq(lobnd, hibnd, length.out = 5)
+    y <- rep(NA,length(x))
+    for (i in 1:length(x)) {
+      y[i] <- MarPas(x[i])
+    }
+    if (any(y < 0.5)) {
+      lobnd = max(x[which(y < 0.5)])
+      change = 1
+    }
+    if (any(y > 0.5)){
+      hibnd = min(x[which(y > 0.5)])
+      change = 1
+    }
+  }
+  med = (hibnd + lobnd) / 2
+  return(med)
+}
+
+marcenko_pastur_integral <- function(x, beta) {
+  if (beta <= 0 | beta > 1) stop("beta must be > 0 and <=1")
+  lobnd <- (1 - sqrt(beta))^2
+  hibnd <- (1 + sqrt(beta))^2
+  if (x < lobnd | x > hibnd) stop("X is out of bounds")
+  dens <- function(t) sqrt((hibnd - t) * (t - lobnd)) / (2 * pi * beta * t)
+  Int <- stats::integrate(dens, lobnd, x)
+  print(cat("\r", paste("x=", x, " beta=", beta,
+                        " I=", round(Int$value, 5), sep = "")))
+  return(Int$value)
+}
+
 
 process.locus = function(locus, input, phenos=NULL, min.K=2, prune.thresh=99, max.prop.K=0.75, drop.failed=T) {
 	if (is.data.frame(locus) && nrow(locus)!=1) { print("Error: Locus info provided for incorrect number of loci. Please provide only a single locus at a time"); loc=NULL; return(NULL) }  # modified cdl 18/3
@@ -98,8 +167,10 @@ process.locus = function(locus, input, phenos=NULL, min.K=2, prune.thresh=99, ma
 		eig = eigen(cor(X))
 		lambda = eig$values
 		Q = eig$vectors
+		print(paste("Eigen Decompostion of cox(X) returned",length(lambda),"PCs in locus",loc$id))
 	} else {
 		lambda = svd$d * svd$d / (N.ref-1)
+		print(paste("SVD returned",length(lambda),"PCs in locus",loc$id))
 		Q = svd$v
 	}
 	cum.perc = cumsum(lambda / sum(lambda) * 100)
@@ -135,7 +206,7 @@ process.locus = function(locus, input, phenos=NULL, min.K=2, prune.thresh=99, ma
 	# Check remaining nr of PCs (moved down, cdl 16/3)
 	K.max = length(keep) # K renamed to K.max after updating the fit.logistic() function; K is defined within while loop
 	if (K.max < min.K) { print(paste("Error: Fewer than",min.K,"PCs in locus",loc$id)); loc=NULL; return(NULL) } # K can drop below min.K during for-loop below, so need to check here; this also ensures the while is guaranteed to terminate
-
+        print(paste("This analysis used ",K.max,"PCs in locus",loc$id))
 	# Define G/R for binary phenotypes (used by fit.logistic())
 	if (any(loc$binary)) { R = Q[,keep] %*% diag(1/sqrt(lambda[keep])); G = X %*% R } # NOTE: these are further subsetted within the fit.logistic() function if any PCs are dropped, so there is no need to subset again in the while loop
 	
@@ -229,7 +300,196 @@ process.locus = function(locus, input, phenos=NULL, min.K=2, prune.thresh=99, ma
 	return(loc)
 }
 
+process.locus_opt = function(locus, input, phenos=NULL, min.K=2, prune.thresh=99, max.prop.K=0.90, drop.failed=T) {
+	if (is.data.frame(locus) && nrow(locus)!=1) { print("Error: Locus info provided for incorrect number of loci. Please provide only a single locus at a time"); loc=NULL; return(NULL) }  # modified cdl 18/3
+	if (!(all(c("LOC","CHR","START","STOP") %in% names(locus)) | all(c("LOC","SNPS") %in% names(locus)))) { print("Error: Locus info data frame is missing some or all of the required headers ('LOC' + 'CHR','START','STOP' and/or 'SNPS')"); loc=NULL; return(NULL) }
+	
+	min.K = max(min.K, 2) # just to make sure it isn't 1, because that leads to some matrix multiplication dimension issues
+	
+	# define locus environment & add locus info
+	loc = new.env(parent=globalenv())
+	loc$id = locus$LOC; loc$chr = locus$CHR; loc$start = locus$START; loc$stop = locus$STOP; loc$snps = locus$SNPS
+	
+	# add phenotype info (modified + added eQTL check (cdl 18/3))
+	if (is.null(phenos)) { 
+		phenos = as.character(input$info$phenotype) 
+	} else {
+		phenos = as.character(phenos) # to guard against unintentional factors
+	}
+	if (any(! phenos %in% as.character(input$info$phenotype))) {print(paste0("Error: Invalid phenotype ID(s) provided: '",paste0(phenos[! phenos %in% as.character(input$info$phenotype)]), collapse="', '","'")); loc=NULL; return(NULL) }
+	if ("eqtl" %in% names(input$info) && any(input$info$eqtl[match(phenos, input$info$phenotype)]) && class(locus) != "gene") {print("Error: use function process.eqtl.locus when analyzing eQTL input"); loc=NULL; return(NULL)} #still works on eQTL input if eqtl phenotype not actually analysed
+	loc$phenos = phenos; loc$P = length(loc$phenos)
+ 	loc$binary = input$info$binary[match(loc$phenos, input$info$phenotype)]; names(loc$binary) = loc$phenos
 
+	# get locus SNPs
+	if (!is.null(loc$snps)) {
+		# if available, use SNP list
+		if (!is.list(loc$snps)) {  # added cdl 18/3
+			loc$snps = tolower(unlist(strsplit(loc$snps, ';')))
+		}
+	} else {
+		# if not, use bim file coordinates
+		loc$snps = tolower(input$ref$bim$snp.name[input$ref$bim$chromosome == loc$chr & input$ref$bim$position >= loc$start & input$ref$bim$position <= loc$stop])
+	}
+	# subset to SNPs that passed input processing (i.e. exists across data sets + were aligned)
+	loc$snps = unique(intersect(input$analysis.snps, loc$snps))	# taking unique in case there are duplicates in loc$snps; using to intersect() to ensure order is same as reference data set
+	
+	# check that no. SNPs > min.K
+	loc$n.snps = length(loc$snps)
+	if (loc$n.snps < min.K) { print(paste("Fewer than",min.K,"SNPs in locus",loc$id)); loc=NULL; return(NULL) }
+	
+	# read in genotype data (only locus SNPs)
+	X = read.plink.custom(input$ref.prefix, df.bim=input$ref, select.snps=loc$snps)
+	X = as(X$genotypes, "numeric")
+	X = scale(X)			# standardise
+	X[is.na(X)] = 0			# mean imputation for missing data
+	X = scale(X)
+	N.ref = nrow(X)
+	
+	# remove non variant SNPs
+	non.var = apply(X, 2, function(x) all(is.na(x)))
+	if(any(non.var)) {
+		X = X[,!non.var]
+		loc$snps = loc$snps[!non.var]
+	}
+	
+	# check that order of SNPs match
+	if (!all(tolower(colnames(X))==loc$snps)) { stop(paste0("Program Error: Mismatching SNP order between reference data and analysis SNPs in locus", loc$id,". Please contact developer.")) } # this should never be triggered, but just in case
+	
+	# prune redundant PCs
+	svd = try(svd(X), silent=T)	# try svd
+	if (class(svd)=="try-error") { svd = try(svd(X), silent=T) } 	# if fails, try again (some randomness causing error occasionally)
+	if (class(svd)=="try-error") {					# if it fails again, do eig
+		eig = eigen(cor(X))
+		lambda = eig$values
+		Q = eig$vectors
+        print(paste("Eigen Decompostion of cox(X) returned",length(lambda),"PCs in locus",loc$id))
+	} else {
+		lambda = svd$d * svd$d / (N.ref-1)
+        print(paste("SVD returned",length(lambda),"PCs in locus",loc$id))
+		Q = svd$v
+	}
+	cum.perc = cumsum(lambda / sum(lambda) * 100)
+	keep = 1:min(which(cum.perc >= prune.thresh))
+    
+    osv <- optimal_SVHT_coef(beta= min(dim(X))/max(dim(X)))
+    svs <- svd$d
+    
+    optimK <- min(length(svs[svs < (osv * median(svs))])+5,length(svs))
+
+	# Check remaining nr of PCs
+	K.max = optimK # K renamed to K.max after updating the fit.logistic() function; K is defined within while loop
+
+	if (K.max < min.K) { print(paste("Error: Fewer than",min.K,"PCs in locus",loc$id)); loc=NULL; return(NULL) } # K can drop below min.K during for-loop below, so need to check here; this also ensures the while is guaranteed to terminate
+	
+	# Subset sum-stats and get locus N
+	loc.sum = list(); loc$N = rep(NA, loc$P); names(loc$N) = loc$phenos
+	for (i in loc$phenos) {
+		# subset sumstats to locus SNPs
+		loc.sum[[i]] = input$sum.stats[[i]][input$sum.stats[[i]]$SNP %in% loc$snps,]
+		if (!all(loc.sum[[i]]$SNP==loc$snps)) { stop(paste0("Program Error: Mismatching SNP order between sum-stats and reference data for locus", loc$id,". Please contact developer.")) }	# this should never be triggered, but just in case
+		# get N
+		loc$N[i] = mean(loc.sum[[i]]$N, na.rm=T)	# get mean locus N (for sumstats i)
+		if (is.na(loc$N[i])) { loc$N[i] = mean(input$sum.stats[[i]]$N, na.rm=T) }	# if all are NA, set to mean N across all SNPs in sumstats
+		loc.sum[[i]]$N[is.na(loc.sum[[i]]$N)] = loc$N[i]	# use mean imputation any for missing per SNP N 
+	}
+
+	# Check remaining nr of PCs (moved down, cdl 16/3)
+    # K renamed to K.max after updating the fit.logistic() function; K is defined within while loop
+	if (K.max < min.K) { print(paste("Error: Fewer than",min.K,"PCs in locus",loc$id)); loc=NULL; return(NULL) } # K can drop below min.K during for-loop below, so need to check here; this also ensures the while is guaranteed to terminate
+    print(paste("This analysis used ",K.max,"PCs in locus",loc$id))
+	# Define G/R for binary phenotypes (used by fit.logistic())
+	if (any(loc$binary)) { R = Q[,keep] %*% diag(1/sqrt(lambda[keep])); G = X %*% R } # NOTE: these are further subsetted within the fit.logistic() function if any PCs are dropped, so there is no need to subset again in the while loop
+	
+	loc$sigma = loc$h2.obs = loc$h2.latent = rep(NA, loc$P); names(loc$sigma) = names(loc$h2.obs) = names(loc$h2.latent) = loc$phenos
+	dropped = c()	# any PCs that might be dropped by fit.logistic() due to instability
+	
+	while (T) {
+		keep = which(!(1:K.max %in% dropped))
+		loc$K = length(keep)
+		if (loc$K < min.K) { print(paste("Error: Fewer than",min.K,"PCs in locus",loc$id)); loc=NULL; return(NULL) } # K can drop below min.K during for-loop below, so need to check here; this also ensures the while is guaranteed to terminate
+		
+		loc$delta = matrix(NA, loc$K, loc$P); colnames(loc$delta) = loc$phenos # this needs to be defined in here so it updates to right size if further PCs dropped
+		rerun = F # will be set to true in case additional PCs dropped during 1:P loop by fit.logistic
+		
+		for (i in loc$phenos) {
+			if (loc$binary[i]) {
+				fit = fit.logistic(G, X, R, loc$N[i], subset(input$info,phenotype==i)$prop_cases, loc.sum[[i]]$STAT, loc.sum[[i]]$N, phen.id=i, loc.id=loc$id, dropped=dropped)
+				if (is.na(fit[1])) { warning(paste0("Multiple logistic regression model for phenotype '",i,"' in locus ",loc$id," failed to converge (inversion error)")); next() }
+				
+				# the fit$dropped vector contains IDs of all dropped PCs, including by other phenotypes (or by the same phenotype earlier), so checking here if it got longer
+				# if so, this will break out of the current for-loop and re-process all phenotypes with the new dropped vector
+				if (length(fit$dropped) > length(dropped)) {
+					dropped = fit$dropped
+					rerun = T; break
+				}
+				loc$delta[,i] = fit$beta
+				loc$sigma[i] = fit$var
+				loc$h2.obs[i] = fit$h2.obs
+				
+				# compute h2 if pop prevalence info is provided
+				if (!is.null(input$info$prevalence)) {
+					loc$h2.latent[i] = fit$h2.obs * (subset(input$info,phenotype==i)$prevalence * (1-subset(input$info,phenotype==i)$prevalence) / dnorm(qnorm(subset(input$info,phenotype==i)$prevalence))^2)
+				}
+			} else {
+				r = loc.sum[[i]]$STAT / sqrt(loc.sum[[i]]$STAT^2 + loc.sum[[i]]$N - 2)	# for continuous phenos, convert Z to r
+				alpha = Q[,keep] %*% diag(1/lambda[keep]) %*% t(Q[,keep]) %*% r 
+				
+				loc$delta[,i] = diag(c(sqrt(lambda[keep]))) %*% t(Q[,keep]) %*% alpha	# using keep to filter out dropped PCs (since this one is updated every time a PC is dropped)
+				eta = t(r) %*% alpha; eta = (loc$N[i]-1) / (loc$N[i]-loc$K-1) * (1-eta)
+				loc$sigma[i] = eta/(loc$N[i]-1)
+				
+				# get h2
+				loc$h2.obs[i] = 1 - (1 - t(loc$delta[,i]) %*% loc$delta[,i]) * ((loc$N[i]-1) / (loc$N[i]-loc$K-1))
+			}
+		}
+		if (!rerun) break # end while loop
+	}
+	if (loc$P > 1) { loc$sigma = diag(loc$sigma) }; if (!is.null(input$sample.overlap)) { loc$sigma = sqrt(loc$sigma) %*% as.matrix(input$sample.overlap[loc$phenos,loc$phenos]) %*% sqrt(loc$sigma) } # if P > 1 is just because the diag() doesn't work for single phenotype
+	loc$sigma = as.matrix(loc$sigma); dimnames(loc$sigma) = rep(list(loc$phenos),2)
+	
+	# cap any negative h2's at 0
+	loc$h2.obs[loc$h2.obs<0] = 0
+	loc$h2.latent[loc$h2.latent<0] = 0
+
+	# remove h2's if K/N ratio too high (cdl 22/3)
+	thresh.ratio = 0.1
+	if (any(loc$K / loc$N > thresh.ratio)) {
+		loc$h2.obs[loc$K/loc$N > thresh.ratio] = NA
+		loc$h2.latent[loc$K/loc$N > thresh.ratio] = NA
+	}
+
+	# get full omega
+	loc$omega = t(loc$delta)%*%loc$delta / loc$K - loc$sigma
+	loc$omega.cor = suppressWarnings(cov2cor(loc$omega))
+
+
+	# check if any phenos have negative sigma or omega;
+	neg.var = diag(loc$sigma) < 0 | diag(loc$omega) < 0;
+	failed = neg.var | is.na(neg.var)	#those that failed due to N < K or wsw.inversion will be NA in the neg.var variable
+
+	if (drop.failed) { # cdl 16/3
+		if (all(neg.var, na.rm=T)) { print(paste0("Error: Negative variance estimate for all phenotypes in locus ",loc$id,". This locus cannot be analysed")); loc=NULL; return(NULL) }	# print error if all had negative variance estimate
+		if (any(neg.var, na.rm=T)) { print(paste0("Warning: Negative variance estimate for phenotype(s) '",paste(loc$phenos[which(neg.var)],collapse="', '"),"' in locus ",loc$id,"; Dropping these as they cannot be analysed")) }
+
+		# remove all phenotypes that failed (either due to negative variance, N < K, or wsw.inversion problem)
+		if (any(failed)) {
+			if (all(failed)) { print(paste0("Error: Processing of all phenotypes in locus ",loc$id," failed (see preceeding warning messages for details)")); loc=NULL; return(NULL) }
+
+			for (var in c("N","binary","phenos","h2.obs","h2.latent")) { loc[[var]] = loc[[var]][!failed] }	 # vectors
+
+			loc$delta = as.matrix(loc$delta[,!failed]); colnames(loc$delta) = loc$phenos	# delta
+
+			for (var in c("sigma","omega","omega.cor")) {   # symmetric matrices
+				loc[[var]] = as.matrix(loc[[var]][!failed,!failed])
+				dimnames(loc[[var]]) = rep(list(loc$phenos),2)	# need to add phenotype IDs again due to as.matrix()
+			}
+		}
+	} else {
+		loc$failed = failed
+	}
+	return(loc)
+}
 
 #' Re-process locus to meta-analyse of selected phenotypes
 #'
