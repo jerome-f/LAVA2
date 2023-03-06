@@ -383,7 +383,7 @@ process.locus_opt = function(locus, input, phenos=NULL, min.K=2, prune.thresh=99
     osv <- optimal_SVHT_coef(beta= min(dim(X))/max(dim(X)))
     svs <- svd$d
     
-    optimK <- min(length(svs[svs < (osv * median(svs))])+5,length(svs))
+    optimK <- min(length(svs[svs > (osv * median(svs))])+2,length(svs))
 
 	# Check remaining nr of PCs
 	K.max = optimK # K renamed to K.max after updating the fit.logistic() function; K is defined within while loop
